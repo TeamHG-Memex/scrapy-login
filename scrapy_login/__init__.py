@@ -1,22 +1,25 @@
+import random
 from twisted.internet.defer import Deferred
 from scrapy.http import Request
 from scrapy import log, signals
-from scrapy.utils.response import open_in_browser
-from scrapy.utils.misc import arg_to_iter
 from scrapy.exceptions import IgnoreRequest
 
 
-def string_or_method(string_or_method_, obj):
-    if isinstance(string_or_method_, basestring):
+def to_callback(string_or_method_, obj):
+    if string_or_method_ is None:
+        method = lambda *args, **kwargs: None
+    elif isinstance(string_or_method_, basestring):
         method = getattr(obj, string_or_method_)
     else:
         method = string_or_method_
     return method
 
 
-class LoginMiddleware(object):
+class LoginError(Exception):
+    pass
 
-    original_start_requests = None
+
+class LoginMiddleware(object):
 
     @classmethod
     def from_crawler(cls, crawler):
@@ -40,99 +43,109 @@ class LoginMiddleware(object):
             return
         if request.meta.get('login_request', False):
             return
-        self._enqueue_if_paused(request, spider)
+        if not request.meta.get('login_final_request', False):
+            self._enqueue_if_paused(request, spider)
 
     def process_response(self, request, response, spider):
         if request.meta.get('login_request', False):
             return response
         if request.meta.get('captcha_request', False):
             return response
-        self._enqueue_if_paused(request, spider)
-
+        if not request.meta.get('login_final_request', False):
+            self._enqueue_if_paused(request, spider)
         self.do_login = getattr(spider, 'do_login', None)
         self.check_login = getattr(spider, 'check_login', None)
+        self.accounts = getattr(spider, 'accounts', None)
         self.username = getattr(spider, 'username', None)
         self.password = getattr(spider, 'password', None)
-        self.login_callback = getattr(spider, 'login_callback', None)
+        login_callback = getattr(spider, 'login_callback', None)
+        self.login_callback = to_callback(login_callback, spider)
+        self.dont_resume = getattr(
+            spider, 'login_dont_resume', False
+        )
+        if self.dont_resume and login_callback is None:
+            spider.log('You should set login_callback if '
+                       'login_dont_resume is set to True, '
+                       'otherwise no request is made after login',
+                       level=log.WARNING)
         self.spider = spider
 
-        if not all((self.check_login, self.do_login, self.username,
-                    self.password)):
+        if not all((self.check_login, self.do_login,
+                    self.accounts or self.username and self.password)):
             return response
+        try:
+            login_status = self.check_login(response)
+        except LoginError as exc:
+            login_successful = False
+            login_message = exc.message
+        else:
+            login_successful = bool(login_status)
+            login_message = None
 
-        if not self.check_login(response):
+        if login_successful:
+            if self.attemp > 0:
+                spider.log('Logged in', level=log.INFO)
+                self._resume_crawling()
+                self.attemp = 0
+            return response
+        else:
+            self._pause_crawling()
+            self._enqueue(request, spider)
+            if not self.username or not self.password:
+                self.username, self.password = random.choice(self.accounts)
+            if login_message:
+                spider.log('Not logged in: {}'.format(login_message),
+                           level=log.WARNING)
+            else:
+                spider.log('Not logged in', level=log.WARNING)
             self.attemp += 1
             if self.max_attemps > 0 and self.attemp > self.max_attemps:
                 spider.log('Max login attemps exceeded', level=log.ERROR)
                 raise IgnoreRequest('Max login attemps exceeded')
             spider.log('Logging in (attemp {})'.format(self.attemp),
                        level=log.INFO)
-            self._pause_crawling()
-            self._enqueue(request, spider)
             request_or_deferred = self.do_login(response, self.username,
                                                 self.password)
             if isinstance(request_or_deferred, Deferred):
                 request_or_deferred.addCallback(
-                    self.deffered_logged_in_callback
+                    self.deffered_login_callback
                 )
                 raise IgnoreRequest()
             elif isinstance(request_or_deferred, Request):
-                request_or_deferred.callback = self.logged_in_callback
+                request_or_deferred.callback = self.login_callback
+                request_or_deferred.meta['login_final_request'] = True
                 request_or_deferred.dont_filter = True
                 return request_or_deferred
             else:
                 raise RuntimeError('do_login must return Request of Deferred')
-        else:
-            self.attemp = 0
-            return response
 
-    def deffered_logged_in_callback(self, request):
+    def deffered_login_callback(self, request):
         if isinstance(request, Request):
-            request.callback = self.logged_in_callback
+            request.callback = self.login_callback
+            request.dont_filter = True
+            request.meta['login_final_request'] = True
             self.crawler.engine.crawl(request, self.spider)
         else:
             raise RuntimeError('Deferred has resolved as non-Request: {}'
                                .format(type(request)))
 
-    def logged_in_callback(self, response):
-        checked = self.check_login(response)
-        if not checked or isinstance(checked, str):
-            self.spider.log('Not logged in: {}'.format(checked),
-                            level=log.ERROR)
-            if self.debug:
-                open_in_browser(response)
-            if self.fail_if_not_logged_in:
-                return
-        else:
-            open_in_browser(response)
-            self.spider.log('Logged in', level=log.INFO)
-        if self.login_callback is not None:
-            login_callback = string_or_method(self.login_callback,
-                                              self.spider)
-            self._resume_crawling(destroy_queue=True)
-            for r in arg_to_iter(login_callback(response)):
-                yield r
-        else:
-            self._resume_crawling()
-
     def _pause_crawling(self):
         self.paused = True
 
-    def _resume_crawling(self, destroy_queue=False):
+    def _resume_crawling(self):
         if not self.paused:
             return
         self.paused = False
-        if not destroy_queue:
+        if self.dont_resume:
+            self.spider.log('Not resuming crawl')
+        else:
             self.spider.log('Resuming crawl: {}'.format(self.queue),
                             level=log.DEBUG)
             for request, spider in self.queue:
                 request.dont_filter = True
                 self.crawler.engine.crawl(request, spider)
-        self.queue[:] = []
 
-    def _spider_idle(self):
-        from scrapy.exceptions import DontCloseSpider
-        raise DontCloseSpider
+        self.queue[:] = []
 
     def _enqueue_if_paused(self, request, spider):
         if self.paused:
