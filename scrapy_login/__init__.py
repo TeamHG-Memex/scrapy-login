@@ -63,6 +63,7 @@ class LoginMiddleware(object):
         self.dont_resume = getattr(
             spider, 'login_dont_resume', False
         )
+        max_attemps = getattr(spider, 'login_max_attemps', self.max_attemps)
         if self.dont_resume and login_callback is None:
             spider.log('You should set login_callback if '
                        'login_dont_resume is set to True, '
@@ -99,16 +100,18 @@ class LoginMiddleware(object):
             else:
                 spider.log('Not logged in', level=log.WARNING)
             self.attemp += 1
-            if self.max_attemps > 0 and self.attemp > self.max_attemps:
+            if max_attemps > 0 and self.attemp > max_attemps:
                 spider.log('Max login attemps exceeded', level=log.ERROR)
                 raise IgnoreRequest('Max login attemps exceeded')
-            spider.log('Logging in (attemp {})'.format(self.attemp),
+            spider.log('Logging in (attemp {}/{})'
+                       .format(self.attemp, max_attemps),
                        level=log.INFO)
             request_or_deferred = self.do_login(response, self.username,
                                                 self.password)
             if isinstance(request_or_deferred, Deferred):
-                request_or_deferred.addCallback(
-                    self.deffered_login_callback
+                request_or_deferred.addCallbacks(
+                    self.deffered_login_callback,
+                    self.deffered_login_errback
                 )
                 raise IgnoreRequest()
             elif isinstance(request_or_deferred, Request):
@@ -126,8 +129,11 @@ class LoginMiddleware(object):
             request.meta['login_final_request'] = True
             self.crawler.engine.crawl(request, self.spider)
         else:
-            raise RuntimeError('Deferred has resolved as non-Request: {}'
+            raise RuntimeError('Deferred has been resolved as non-Request: {}'
                                .format(type(request)))
+
+    def deffered_login_errback(self, failure):
+        self.spider.log('Login failed: {}'.format(failure))
 
     def _pause_crawling(self):
         self.paused = True
