@@ -1,6 +1,6 @@
 import random
 from twisted.internet.defer import Deferred
-from scrapy.http import Request
+from scrapy.http import Request, Response
 from scrapy import log, signals
 from scrapy.exceptions import IgnoreRequest
 
@@ -53,6 +53,9 @@ class LoginMiddleware(object):
             return response
         if not request.meta.get('login_final_request', False):
             self._enqueue_if_paused(request, spider)
+        max_attemps = getattr(spider, 'login_max_attemps', self.max_attemps)
+        if max_attemps > 0 and self.attemp > max_attemps:
+            raise IgnoreRequest('Max login attemps exceeded')
         self.do_login = getattr(spider, 'do_login', None)
         self.check_login = getattr(spider, 'check_login', None)
         self.accounts = getattr(spider, 'accounts', None)
@@ -63,7 +66,6 @@ class LoginMiddleware(object):
         self.dont_resume = getattr(
             spider, 'login_dont_resume', False
         )
-        max_attemps = getattr(spider, 'login_max_attemps', self.max_attemps)
         if self.dont_resume and login_callback is None:
             spider.log('You should set login_callback if '
                        'login_dont_resume is set to True, '
@@ -106,31 +108,34 @@ class LoginMiddleware(object):
             spider.log('Logging in (attemp {}/{})'
                        .format(self.attemp, max_attemps),
                        level=log.INFO)
-            request_or_deferred = self.do_login(response, self.username,
-                                                self.password)
-            if isinstance(request_or_deferred, Deferred):
-                request_or_deferred.addCallbacks(
+            result = self.do_login(response, self.username, self.password)
+            if isinstance(result, Deferred):
+                result.addCallbacks(
                     self.deffered_login_callback,
                     self.deffered_login_errback
                 )
                 raise IgnoreRequest()
-            elif isinstance(request_or_deferred, Request):
-                request_or_deferred.callback = self.login_callback
-                request_or_deferred.meta['login_final_request'] = True
-                request_or_deferred.dont_filter = True
-                return request_or_deferred
+            elif isinstance(result, Request):
+                result.callback = self.login_callback
+                result.meta['login_final_request'] = True
+                result.dont_filter = True
+                return result
+            elif isinstance(result, Response):
+                raise IgnoreRequest()
             else:
                 raise RuntimeError('do_login must return Request of Deferred')
 
-    def deffered_login_callback(self, request):
-        if isinstance(request, Request):
-            request.callback = self.login_callback
-            request.dont_filter = True
-            request.meta['login_final_request'] = True
-            self.crawler.engine.crawl(request, self.spider)
+    def deffered_login_callback(self, result):
+        if isinstance(result, Request):
+            result.callback = self.login_callback
+            result.dont_filter = True
+            result.meta['login_final_request'] = True
+            self.crawler.engine.crawl(result, self.spider)
+        elif isinstance(result, Response):
+            pass
         else:
             raise RuntimeError('Deferred has been resolved as non-Request: {}'
-                               .format(type(request)))
+                               .format(type(result)))
 
     def deffered_login_errback(self, failure):
         self.spider.log('Login failed: {}'.format(failure))
