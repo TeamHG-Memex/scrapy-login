@@ -1,5 +1,5 @@
 import random
-from twisted.internet.defer import Deferred
+from twisted.internet.defer import maybeDeferred
 from scrapy.http import Request, Response
 from scrapy import log, signals
 from scrapy.exceptions import IgnoreRequest
@@ -35,7 +35,7 @@ class LoginMiddleware(object):
         self.max_attemps = crawler.settings.getint('LOGIN_MAX_ATTEMPS', 10)
         self.attemp = 0
         self.debug = crawler.settings.get('LOGIN_DEBUG', False)
-        crawler.signals.connect(self._resume_crawling,
+        crawler.signals.connect(self.spider_idle,
                                 signal=signals.spider_idle)
 
     def process_request(self, request, spider):
@@ -76,6 +76,7 @@ class LoginMiddleware(object):
         if not all((self.check_login, self.do_login,
                     self.accounts or self.username and self.password)):
             return response
+        # Determine login status
         try:
             login_status = self.check_login(response)
         except LoginError as exc:
@@ -108,22 +109,11 @@ class LoginMiddleware(object):
             spider.log('Logging in (attemp {}/{})'
                        .format(self.attemp, max_attemps),
                        level=log.INFO)
-            result = self.do_login(response, self.username, self.password)
-            if isinstance(result, Deferred):
-                result.addCallbacks(
-                    self.deffered_login_callback,
-                    self.deffered_login_errback
-                )
-                raise IgnoreRequest()
-            elif isinstance(result, Request):
-                result.callback = self.login_callback
-                result.meta['login_final_request'] = True
-                result.dont_filter = True
-                return result
-            elif isinstance(result, Response):
-                raise IgnoreRequest()
-            else:
-                raise RuntimeError('do_login must return Request of Deferred')
+            dfd = maybeDeferred(self.do_login, response, self.username,
+                                self.password)
+            dfd.addCallbacks(self.deffered_login_callback,
+                             self.deffered_login_errback)
+            raise IgnoreRequest()
 
     def deffered_login_callback(self, result):
         if isinstance(result, Request):
@@ -138,18 +128,22 @@ class LoginMiddleware(object):
                                .format(type(result)))
 
     def deffered_login_errback(self, failure):
-        self.spider.log('Login failed: {}'.format(failure))
+        self.spider.log('Login failed: {}'.format(failure.getErrorMessage()))
+        self._resume_crawling()
+
+    def spider_idle(self, spider):
+        self._resume_crawling(force=True)
 
     def _pause_crawling(self):
         self.paused = True
 
-    def _resume_crawling(self):
+    def _resume_crawling(self, force=False):
         if not self.paused:
             return
         self.paused = False
-        if self.dont_resume:
+        if self.dont_resume and not force:
             self.spider.log('Not resuming crawl')
-        else:
+        elif self.queue:
             self.spider.log('Resuming crawl: {}'.format(self.queue),
                             level=log.DEBUG)
             for request, spider in self.queue:
@@ -161,7 +155,7 @@ class LoginMiddleware(object):
     def _enqueue_if_paused(self, request, spider):
         if self.paused:
             self._enqueue(request, spider)
-            raise IgnoreRequest('Crawling paused, because login takes a place')
+            raise IgnoreRequest('Crawling paused, because login takes place')
 
     def _enqueue(self, request, spider):
         self.queue.append((request, spider))
